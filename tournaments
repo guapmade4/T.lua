@@ -6528,10 +6528,22 @@ end
 
 local function AutoParryFire(Threat)
     if not AutoParryLocalReady() or not AutoParryCombat then
+        local Reason = not AutoParryCombat and "Combat remote unavailable" or AutoParryRuntime.LastSkip or "Local not ready"
+        AutoParryRuntime.LastBlockedParryReason = Reason
+        AutoParryRuntime.BlockedParryChecks = (AutoParryRuntime.BlockedParryChecks or 0) + 1
+        if Threat.LastParrySkipReason ~= Reason then
+            Threat.LastParrySkipReason = Reason
+            if AutoParryRuntime.Note then AutoParryRuntime.Note("Parry blocked", Reason) end
+        end
         return false
     end
     local Now = os.clock()
-    if Now - AutoParryRuntime.LastParryAt < 0.12 or Now < AutoParryRuntime.ParryReadyAt then
+    if Now - AutoParryRuntime.LastParryAt < 0.12 then
+        AutoParryRuntime.LastSkip = "Parry debounce"
+        return false
+    end
+    if Now < AutoParryRuntime.ParryReadyAt then
+        AutoParryRuntime.LastSkip = "Parry cooldown"
         return false
     end
     local Success, Error = pcall(function()
@@ -6545,7 +6557,7 @@ local function AutoParryFire(Threat)
         return false
     end
     AutoParryRuntime.LastParryAt = Now
-    AutoParryRuntime.ParryReadyAt = Now + 4
+    AutoParryRuntime.ParryReadyAt = Now + 2
     AutoParryRuntime.Parries += 1
     AutoParryRuntime.LastAttacker = Threat.Player and Threat.Player.Name or Threat.Character.Name
     AutoParryRuntime.LastWeapon = Threat.WeaponName
@@ -6803,6 +6815,25 @@ AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = AutoParryRunSe
         local Facing = 1
         if Delta.Magnitude > 0.001 then
             Facing = Root.CFrame.LookVector:Dot(Delta.Unit)
+        end
+        local CurrentDelta = LocalRoot.Position - Root.Position
+        local CurrentDistance = CurrentDelta.Magnitude
+        local OverlapRadius = (math.max(Root.Size.X, Root.Size.Z) + math.max(LocalRoot.Size.X, LocalRoot.Size.Z)) * 0.5
+        local OverlapHeight = (Root.Size.Y + LocalRoot.Size.Y) * 0.5
+        local GeometrySource = "Velocity prediction"
+        -- Replicated velocity can project interpenetrating roots past one another.
+        -- Use current positions and facing within the root-sized overlap region.
+        if CurrentDistance <= OverlapRadius and math.abs(CurrentDelta.Y) <= OverlapHeight then
+            Distance = CurrentDistance
+            Facing = 1
+            if CurrentDistance > 0.001 then
+                Facing = Root.CFrame.LookVector:Dot(CurrentDelta.Unit)
+            end
+            GeometrySource = "Current root overlap"
+        end
+        if Diagnostic then
+            Diagnostic.LastCurrentDistance = CurrentDistance
+            Diagnostic.LastGeometrySource = GeometrySource
         end
         local Lead = math.clamp(Ping + 0.07, 0.07, 0.24)
         local Reach = Threat.Reach + 1.25
@@ -7636,7 +7667,7 @@ local function BuildMainDebug()
     local RightSize = "not sampled"
 
     Lines[#Lines + 1] = "=== eve.club Main Debug ==="
-    Lines[#Lines + 1] = "ScriptVersion: 147"
+    Lines[#Lines + 1] = "ScriptVersion: 148"
     Lines[#Lines + 1] = "Username: " .. tostring(State.Context.Username)
     Lines[#Lines + 1] = "DisplayName: " .. tostring(State.Context.DisplayName)
     Lines[#Lines + 1] = "UserId: " .. tostring(State.Context.UserId)
@@ -7674,6 +7705,8 @@ local function BuildMainDebug()
     Lines[#Lines + 1] = "HeartbeatAgeSeconds: " .. string.format("%.3f", Diagnostic.LastHeartbeatAt and Diagnostic.LastHeartbeatAt > 0 and os.clock() - Diagnostic.LastHeartbeatAt or -1)
     Lines[#Lines + 1] = "NearestEnemyDistance: " .. string.format("%.2f", Diagnostic.NearestEnemyDistance or 0)
     Lines[#Lines + 1] = "LastThreatDistance: " .. string.format("%.2f", Diagnostic.LastDistance or 0)
+    Lines[#Lines + 1] = "LastThreatGeometrySource: " .. tostring(Diagnostic.LastGeometrySource or "none")
+    Lines[#Lines + 1] = "LastThreatCurrentDistance: " .. string.format("%.2f", Diagnostic.LastCurrentDistance or 0)
     Lines[#Lines + 1] = "LastThreatFacingDot: " .. string.format("%.3f", Diagnostic.LastFacing or 0)
     Lines[#Lines + 1] = "LastImpactRemainingSeconds: " .. string.format("%.4f", Diagnostic.LastRemaining or 0)
     Lines[#Lines + 1] = "CombatRemoteAvailable: " .. tostring(AutoParryRuntime.CombatAvailable == true)
@@ -7711,6 +7744,10 @@ local function BuildMainDebug()
     Lines[#Lines + 1] = "AutoParryParries: " .. tostring(State.AutoParryParries or 0)
     Lines[#Lines + 1] = "AutoParryCountType: requests sent"
     Lines[#Lines + 1] = "AutoParryFireErrors: " .. tostring(State.AutoParryFireErrors or 0)
+    Lines[#Lines + 1] = "AutoParryNativeFallbackCooldownSeconds: 2"
+    Lines[#Lines + 1] = "AutoParryBlockedChecks: " .. tostring(AutoParryRuntime.BlockedParryChecks or 0)
+    Lines[#Lines + 1] = "AutoParryLastBlockedReason: " .. tostring(AutoParryRuntime.LastBlockedParryReason or "none")
+    Lines[#Lines + 1] = "AutoParryBlockedCountType: readiness checks, including retries"
     Lines[#Lines + 1] = "AutoParryCooldownRemaining: " .. string.format("%.4f", tonumber(State.AutoParryCooldownRemaining) or 0)
     Lines[#Lines + 1] = "AutoParryAccuracyMisses: " .. tostring(State.AutoParryAccuracyMisses or 0)
     Lines[#Lines + 1] = "AutoParryRejected: " .. tostring(State.AutoParryRejected or 0)
