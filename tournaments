@@ -5782,6 +5782,7 @@ local AutoParryStatsService = game:GetService("Stats")
 local AutoParryLocalPlayer = AutoParryPlayers.LocalPlayer
 local AutoParryCombat = nil
 local AutoParryWeaponStats = nil
+local AutoParryWeaponReach = nil
 local AutoParryWeapons = nil
 
 local AutoParryGlobal = _G
@@ -5962,6 +5963,23 @@ local function AutoParryResolveDependencies()
             AutoParryWeapons = AutoParryReplicatedStorage.Assets.Animations.Weapons
         end)
     end
+    if not AutoParryWeaponReach and not AutoParryRuntime.ResolvingReach then
+        local Modules = AutoParryReplicatedStorage:FindFirstChild("Modules")
+        local Module = Modules and Modules:FindFirstChild("WeaponReach")
+        if Module then
+            AutoParryRuntime.ResolvingReach = true
+            local Success, Result = pcall(require, Module)
+            AutoParryRuntime.ResolvingReach = false
+            if Success and type(Result) == "table" and type(Result.fit) == "function" and type(Result.window) == "function" then
+                AutoParryWeaponReach = Result
+                AutoParryRuntime.ReachError = "none"
+            else
+                AutoParryRuntime.ReachError = tostring(Success and "Invalid WeaponReach interface" or Result):sub(1, 240)
+            end
+        else
+            AutoParryRuntime.ReachError = "WeaponReach unavailable; using weapon stats"
+        end
+    end
     if type(AutoParryWeaponStats) ~= "table" and not AutoParryRuntime.ResolvingStats then
         local Modules = AutoParryReplicatedStorage:FindFirstChild("Modules")
         local Module = Modules and Modules:FindFirstChild("WeaponStats")
@@ -6138,7 +6156,7 @@ local function AutoParryClassifyAnimation(Stats, Track)
                 if Index.Dirty then
                     for _, Connection in ipairs(Index.Watchers) do Connection:Disconnect() end
                     Index.Watchers = {}
-                    local Kinds = {}
+                    local Kinds, AttackKeys = {}, {}
                     for _, Object in ipairs(Set:GetDescendants()) do
                         -- Folder renames can also change the attack category.
                         local Connection = Object.Changed:Connect(function(Property)
@@ -6160,12 +6178,20 @@ local function AutoParryClassifyAnimation(Stats, Track)
                                 Noncombat = Lower == "victim" or Parent == "main" or Parent == "blocking" or Parent == "flinch" or Parent == "parryanims" or Parent == "execution"
                             end
                             if Id ~= "" then
-                                if Kind then Kinds[Id] = Kind
+                                if Kind then
+                                    Kinds[Id] = Kind
+                                    local Combo = Object.Name:match("^Swing(%d+)$")
+                                    local Key = Kind == "RunSwing" and "Run" or Combo and ("S" .. Combo)
+                                    if Key then
+                                        AttackKeys[Id] = AttackKeys[Id] or {}
+                                        AttackKeys[Id][#AttackKeys[Id] + 1] = Key
+                                    end
                                 elseif Noncombat and Kinds[Id] == nil then Kinds[Id] = false end
                             end
                         end
                     end
                     Index.Kinds = Kinds
+                    Index.AttackKeys = AttackKeys
                     Index.Dirty = false
                     AutoParryRuntime.AnimationIndexBuilds = (AutoParryRuntime.AnimationIndexBuilds or 0) + 1
                 end
@@ -6202,7 +6228,7 @@ local function AutoParryAttackSpeed(Stats, Kind, Track)
     return math.max(0.05, Speed)
 end
 
-local function AutoParryReach(Stats, Kind)
+local function AutoParryReach(Stats, Kind, WeaponName, Track)
     local Size = Stats.M1HitboxSize
     local Offset = Stats.M1Offset
     if Kind == "Heavy" and typeof(Stats.M2HitboxSize) == "Vector3" then
@@ -6211,6 +6237,25 @@ local function AutoParryReach(Stats, Kind)
     if Kind == "Heavy" and typeof(Stats.M2Offset) == "CFrame" then
         Offset = Stats.M2Offset
     end
+    if AutoParryWeaponReach and WeaponName and Track and (Kind == "M1" or Kind == "RunSwing") and typeof(Size) == "Vector3" and typeof(Offset) == "CFrame" then
+        local RawId = tostring(Track.Animation and Track.Animation.AnimationId or "")
+        local Id = RawId:match("(%d+)$")
+        local Set = AutoParryWeapons and AutoParryWeapons:FindFirstChild(tostring(Stats.Animations))
+        local Index = Set and AutoParryRuntime.AnimationIndexes and AutoParryRuntime.AnimationIndexes[Set]
+        local Keys = Index and Index.AttackKeys and Index.AttackKeys[Id] or {Kind == "RunSwing" and "Run" or "Default"}
+        local NativeReach = 0
+        for _, Key in ipairs(Keys) do
+            local Success, FittedSize, FittedOffset = pcall(AutoParryWeaponReach.fit, WeaponName, Key ~= "Default" and Key or nil, Size, Offset)
+            if Success and typeof(FittedSize) == "Vector3" and typeof(FittedOffset) == "CFrame" then
+                NativeReach = math.max(NativeReach, math.abs(FittedOffset.Position.Z) + FittedSize.Z * 0.5)
+            end
+        end
+        if NativeReach > 0 and NativeReach < math.huge then
+            AutoParryRuntime.LastReachSource = "Native per-swing WeaponReach.fit"
+            return NativeReach
+        end
+    end
+    AutoParryRuntime.LastReachSource = "WeaponStats geometry fallback"
     local Reach = 7
     if typeof(Size) == "Vector3" then
         Reach = math.max(Reach, Size.Z * 0.5)
@@ -6224,7 +6269,7 @@ local function AutoParryReach(Stats, Kind)
     return Reach
 end
 
-local function AutoParryImpactKeyTime(Stats, Kind, Track)
+local function AutoParryImpactKeyTime(Stats, Kind, Track, AfterKeyTime)
     local Speed = AutoParryAttackSpeed(Stats, Kind, Track)
     local Length = 0
     pcall(function() Length = tonumber(Track.Length) or 0 end)
@@ -6248,7 +6293,7 @@ local function AutoParryImpactKeyTime(Stats, Kind, Track)
             end
         end
     end
-    if Entry and not Entry.Loading and not Entry.Time and (not Entry.Tried or os.clock() >= Entry.RetryAt) and (AutoParryRuntime.TimingWorkers or 0) < 2 then
+    if Entry and not Entry.Loading and (not Entry.Tried or os.clock() >= Entry.RetryAt) and (AutoParryRuntime.TimingWorkers or 0) < 2 then
         Entry.Loading = true
         Entry.Status = "Loading animation metadata"
         Entry.Tried = true
@@ -6262,7 +6307,22 @@ local function AutoParryImpactKeyTime(Stats, Kind, Track)
                 Entry.Clip = Clip
                 Entry.ClipClass = tostring(Clip.ClassName or "unknown")
                 AutoParryRuntime.LastTimingClipClass = Entry.ClipClass
-                local MarkerNames = {}
+                local MarkerNames, HitTimes, EndTimes = {}, {}, {}
+                local function RecordMarker(Name, Time)
+                    if type(Name) ~= "string" or Name == "" then return end
+                    MarkerNames[Name] = true
+                    Time = tonumber(Time)
+                    if not Time or Time ~= Time or Time <= 0 or Time == math.huge then return end
+                    if HitNames[Name] then
+                        HitTimes[#HitTimes + 1] = Time
+                        if not Entry.Time or Time < Entry.Time then
+                            Entry.Time = Time
+                            Entry.Source = Clip:IsA("CurveAnimation") and "Curve animation hit marker" or "Animation hit marker"
+                        end
+                    elseif Name == "HitEnd" or Name == "DamageEnd" or Name == "HitStop" then
+                        EndTimes[#EndTimes + 1] = Time
+                    end
+                end
                 if Clip:IsA("CurveAnimation") then
                     AutoParryRuntime.TimingCurveClips = (AutoParryRuntime.TimingCurveClips or 0) + 1
                     for _, Curve in ipairs(Clip:GetDescendants()) do
@@ -6271,36 +6331,32 @@ local function AutoParryImpactKeyTime(Stats, Kind, Track)
                                 if type(Marker) == "table" then
                                     local Time = tonumber(Marker.Time or Marker.time)
                                     local Name = Marker.Name or Marker.name or Marker.Value or Marker.value
-                                    if HitNames[Curve.Name] then Name = Curve.Name end
-                                    if type(Name) == "string" then
-                                        MarkerNames[Name] = true
-                                        if HitNames[Name] and Time and Time == Time and Time > 0 and Time < math.huge
-                                            and (not Entry.Time or Time < Entry.Time) then
-                                            Entry.Time = Time
-                                            Entry.Source = "Curve animation hit marker"
-                                        end
-                                    end
+                                    if HitNames[Curve.Name] or Curve.Name == "HitEnd" or Curve.Name == "DamageEnd" or Curve.Name == "HitStop" then Name = Curve.Name end
+                                    RecordMarker(Name, Time)
                                 end
                             end
                         end
                     end
                 elseif Clip:IsA("KeyframeSequence") then
                 for _, Frame in ipairs(Clip:GetKeyframes()) do
-                    local Time = tonumber(Frame.Time) or 0
-                    local Hit = HitNames[Frame.Name] == true
+                    RecordMarker(Frame.Name, Frame.Time)
                     for _, Marker in ipairs(Frame:GetMarkers()) do
-                        MarkerNames[Marker.Name] = true
-                        if HitNames[Marker.Name] then Hit = true end
-                    end
-                    if Hit and Time > 0 and (not Entry.Time or Time < Entry.Time) then
-                        Entry.Time = Time
-                        Entry.Source = "Animation hit marker"
+                        RecordMarker(Marker.Name, Frame.Time)
                     end
                 end
                 else
                     Entry.Status = "Unsupported animation clip type: " .. Entry.ClipClass
                     AutoParryRuntime.TimingUnsupportedClips = (AutoParryRuntime.TimingUnsupportedClips or 0) + 1
                     return
+                end
+                if Entry.Time then HitTimes[#HitTimes + 1] = Entry.Time end
+                table.sort(HitTimes)
+                table.sort(EndTimes)
+                Entry.HitTimes, Entry.EndTimes = {}, EndTimes
+                for _, Time in ipairs(HitTimes) do
+                    if #Entry.HitTimes == 0 or Time - Entry.HitTimes[#Entry.HitTimes] > 0.0001 then
+                        Entry.HitTimes[#Entry.HitTimes + 1] = Time
+                    end
                 end
                 local Names = {}
                 for Name in pairs(MarkerNames) do Names[#Names + 1] = Name end
@@ -6326,8 +6382,15 @@ local function AutoParryImpactKeyTime(Stats, Kind, Track)
     end
     if Entry and Entry.Time then
         AutoParryRuntime.LastTimingFallbackReason = "none"
+        if AfterKeyTime then
+            for _, Time in ipairs(Entry.HitTimes or {Entry.Time}) do
+                if Time > AfterKeyTime + 0.0001 then return Time, Speed, Entry.Source end
+            end
+            return nil, Speed, "No remaining hit marker"
+        end
         return Entry.Time, Speed, Entry.Source
     end
+    if AfterKeyTime then return nil, Speed, "No remaining hit marker" end
     AutoParryRuntime.LastTimingFallbackReason = Entry and (Entry.Status or "Waiting for metadata worker") or "Animation asset ID unavailable"
     local Fraction = 0.42
     local Fallback = 0.30
@@ -6345,6 +6408,51 @@ local function AutoParryImpactKeyTime(Stats, Kind, Track)
         return Length * Fraction, Speed, "Length fraction"
     end
     return Fallback * Speed, Speed, "Unloaded animation fallback"
+end
+
+AutoParryRuntime.AdvanceThreat = function(Threat)
+    local NextTime, Speed, TimingSource = AutoParryImpactKeyTime(Threat.Stats, Threat.Kind, Threat.Track, Threat.ImpactKeyTime)
+    if not NextTime then
+        local RawId = tostring(Threat.Track and Threat.Track.Animation and Threat.Track.Animation.AnimationId or "")
+        local Id = RawId:match("(%d+)$")
+        local Entry = AutoParryRuntime.ImpactMetadata and AutoParryRuntime.ImpactMetadata[Id]
+        if Entry and (Entry.Loading or not Entry.Tried) then
+            Threat.WaitingForMetadata = true
+            Threat.Resolved = false
+            return true
+        end
+        return false
+    end
+    Threat.WaitingForMetadata = nil
+    Threat.ImpactGeneration = (Threat.ImpactGeneration or 0) + 1
+    Threat.AfterImpactTime = Threat.ImpactKeyTime
+    Threat.ImpactKeyTime, Threat.Speed, Threat.TimingSource = NextTime, Speed, TimingSource
+    Threat.Resolved = false
+    Threat.DodgeAttempted = nil
+    Threat.AccuracyRecorded = nil
+    Threat.LastParrySkipReason = nil
+    AutoParryRuntime.MultiHitAdvances = (AutoParryRuntime.MultiHitAdvances or 0) + 1
+    return true
+end
+
+AutoParryRuntime.ActiveWindow = function(Stats, Track, ImpactTime, Speed)
+    local Duration = tonumber(Stats.MeleeActiveTime) or 0.15
+    if Duration ~= Duration or Duration <= 0 or Duration == math.huge then Duration = 0.15 end
+    local EndTime = ImpactTime + Duration
+    if AutoParryWeaponReach and Track then
+        local Proxy = {Animation = Track.Animation, TimePosition = ImpactTime, Speed = Speed}
+        local Success, _, NativeEnd = pcall(AutoParryWeaponReach.window, Proxy, Duration)
+        if Success and type(NativeEnd) == "number" and NativeEnd == NativeEnd and NativeEnd >= ImpactTime and NativeEnd < math.huge then
+            EndTime = NativeEnd
+        end
+    end
+    local RawId = tostring(Track and Track.Animation and Track.Animation.AnimationId or "")
+    local Id = RawId:match("(%d+)$")
+    local Entry = AutoParryRuntime.ImpactMetadata and AutoParryRuntime.ImpactMetadata[Id]
+    for _, MarkerEnd in ipairs(Entry and Entry.EndTimes or {}) do
+        if MarkerEnd > ImpactTime + 0.0001 then EndTime = MarkerEnd; break end
+    end
+    return EndTime, math.max(0.05, (EndTime - ImpactTime) / math.max(0.05, Speed))
 end
 
 local function AutoDodgePoll()
@@ -6371,7 +6479,9 @@ local function AutoDodgePoll()
         if Pending.Character == Character and Dashing then
             State.Dodges += 1
             State.LastAttacker = Pending.Threat.Player and Pending.Threat.Player.Name or Pending.Threat.Character.Name
-            Pending.Threat.Resolved = true
+            if (Pending.Threat.ImpactGeneration or 0) == Pending.ImpactGeneration then
+                Pending.Threat.Resolved = true
+            end
             State.Pending = nil
             State.LastSkip = "none"
             if AutoParryRuntime.Note then AutoParryRuntime.Note("Dodge started", State.LastAttacker) end
@@ -6421,7 +6531,7 @@ local function AutoDodgeFire(Threat)
     local Now = os.clock()
     Threat.DodgeAttempted = true
     State.LastRequestAt = Now
-    State.Pending = {Character = Character, Threat = Threat, CreatedAt = Now}
+    State.Pending = {Character = Character, Threat = Threat, CreatedAt = Now, ImpactGeneration = Threat.ImpactGeneration or 0}
     local Success, Error = pcall(function() Action:Fire("Dash") end)
     if not Success then
         State.FireErrors += 1
@@ -6655,7 +6765,7 @@ local function AutoParryRegisterTrack(Player, Character, Track, Restart)
         ImpactKeyTime = ImpactKeyTime,
         TimingSource = TimingSource,
         Speed = Speed,
-        Reach = AutoParryReach(Stats, Kind),
+        Reach = AutoParryReach(Stats, Kind, WeaponName, Track),
         Parryable = Stats.Parryable ~= false,
         AccuracyPassed = AutoParryAccuracy(),
         Resolved = false,
@@ -6771,9 +6881,17 @@ AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = AutoParryRunSe
     local Active = 0
     local Ping = AutoParryPing()
     for Track, Threat in pairs(AutoParryRuntime.Threats) do
-        if Threat.Resolved or not Threat.Character.Parent or not Track.IsPlaying then
+        if not Threat.Character.Parent or not Track.IsPlaying then
             AutoParryRuntime.Threats[Track] = nil
             continue
+        end
+        if Threat.Resolved or Threat.WaitingForMetadata then
+            if not AutoParryRuntime.AdvanceThreat(Threat) then
+                AutoParryRuntime.Threats[Track] = nil
+                continue
+            elseif Threat.WaitingForMetadata then
+                continue
+            end
         end
         Active += 1
         local Root = Threat.Character:FindFirstChild("HumanoidRootPart")
@@ -6782,7 +6900,8 @@ AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = AutoParryRunSe
             AutoParryRuntime.Threats[Track] = nil
             continue
         end
-        Threat.ImpactKeyTime, Threat.Speed, Threat.TimingSource = AutoParryImpactKeyTime(Threat.Stats, Threat.Kind, Track)
+        Threat.ImpactKeyTime, Threat.Speed, Threat.TimingSource = AutoParryImpactKeyTime(Threat.Stats, Threat.Kind, Track, Threat.AfterImpactTime)
+        Threat.Reach = AutoParryReach(Threat.Stats, Threat.Kind, Threat.WeaponName, Track)
         AutoParryRuntime.LastObservedTimingSource = Threat.TimingSource
         local TrackSpeed = Threat.Speed
         pcall(function()
@@ -6792,17 +6911,26 @@ AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = AutoParryRunSe
         end)
         local TimePosition = 0
         pcall(function() TimePosition = tonumber(Track.TimePosition) or 0 end)
+        if TrackSpeed <= 0.01 or (tonumber(Track.Speed) or TrackSpeed) <= 0.01 then
+            if AutoParryRuntime.Diagnostics then AutoParryRuntime.Diagnostics.LastThreatSkip = "Animation paused" end
+            continue
+        end
+        local ActiveEnd, LateWindow = AutoParryRuntime.ActiveWindow(Threat.Stats, Track, Threat.ImpactKeyTime, TrackSpeed)
         local Remaining = (Threat.ImpactKeyTime - TimePosition) / math.max(0.05, TrackSpeed)
         Threat.LastRemaining = Remaining
         local Diagnostic = AutoParryRuntime.Diagnostics
-        if Diagnostic then Diagnostic.LastRemaining = Remaining end
-        if Remaining < -0.18 then
+        if Diagnostic then
+            Diagnostic.LastRemaining = Remaining
+            Diagnostic.LastActiveEndTime = ActiveEnd
+            Diagnostic.LastActiveWindowSeconds = LateWindow
+        end
+        if Remaining < -LateWindow then
             if Diagnostic then
                 Diagnostic.ExpiredAttacks += 1
                 Diagnostic.LastThreatSkip = "Attack timing expired"
             end
             Threat.Resolved = true
-            AutoParryRuntime.Threats[Track] = nil
+            if not AutoParryRuntime.AdvanceThreat(Threat) then AutoParryRuntime.Threats[Track] = nil end
             continue
         end
         local PredictTime = math.max(0, Remaining) + Ping
@@ -6841,12 +6969,12 @@ AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = AutoParryRunSe
             Diagnostic.LastDistance = Distance
             Diagnostic.LastFacing = Facing
             if Remaining > Lead then Diagnostic.LastThreatSkip = "Waiting for impact window"
-            elseif Remaining < -0.05 then Diagnostic.LastThreatSkip = "Impact window missed"
+            elseif Remaining < -LateWindow then Diagnostic.LastThreatSkip = "Impact window missed"
             elseif Distance > Reach then Diagnostic.LastThreatSkip = "Out of range"
             elseif Facing < -0.1 then Diagnostic.LastThreatSkip = "Enemy facing away"
             else Diagnostic.LastThreatSkip = "Impact window reached" end
         end
-        if Remaining <= Lead and Remaining >= -0.05 and Distance <= Reach and Facing >= -0.1 then
+        if Remaining <= Lead and Remaining >= -LateWindow and Distance <= Reach and Facing >= -0.1 then
             if Threat.Parryable ~= false and Threat.AccuracyPassed then
                 Threat.Resolved = AutoParryFire(Threat)
             elseif Threat.Parryable ~= false and AutoParryFlag("AutoParry") == true and not Threat.AccuracyRecorded then
@@ -6858,7 +6986,7 @@ AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = AutoParryRunSe
             elseif not Threat.Resolved and Threat.Parryable ~= false and not Threat.AccuracyPassed then
                 Threat.Resolved = true
             end
-            if Threat.Resolved then
+            if Threat.Resolved and not AutoParryRuntime.AdvanceThreat(Threat) then
                 AutoParryRuntime.Threats[Track] = nil
             end
         end
@@ -7667,7 +7795,7 @@ local function BuildMainDebug()
     local RightSize = "not sampled"
 
     Lines[#Lines + 1] = "=== eve.club Main Debug ==="
-    Lines[#Lines + 1] = "ScriptVersion: 148"
+    Lines[#Lines + 1] = "ScriptVersion: 149"
     Lines[#Lines + 1] = "Username: " .. tostring(State.Context.Username)
     Lines[#Lines + 1] = "DisplayName: " .. tostring(State.Context.DisplayName)
     Lines[#Lines + 1] = "UserId: " .. tostring(State.Context.UserId)
@@ -7712,6 +7840,12 @@ local function BuildMainDebug()
     Lines[#Lines + 1] = "CombatRemoteAvailable: " .. tostring(AutoParryRuntime.CombatAvailable == true)
     Lines[#Lines + 1] = "WeaponStatsAvailable: " .. tostring(AutoParryRuntime.StatsAvailable == true)
     Lines[#Lines + 1] = "WeaponAnimationsAvailable: " .. tostring(AutoParryRuntime.AnimationsAvailable == true)
+    Lines[#Lines + 1] = "MultiHitMarkerAdvances: " .. tostring(AutoParryRuntime.MultiHitAdvances or 0)
+    Lines[#Lines + 1] = "NativeWeaponReachAvailable: " .. tostring(AutoParryWeaponReach ~= nil)
+    Lines[#Lines + 1] = "NativeWeaponReachError: " .. tostring(AutoParryRuntime.ReachError or "none")
+    Lines[#Lines + 1] = "AttackReachSource: " .. tostring(AutoParryRuntime.LastReachSource or "none")
+    Lines[#Lines + 1] = "AttackActiveEndKeyTime: " .. string.format("%.4f", Diagnostic.LastActiveEndTime or 0)
+    Lines[#Lines + 1] = "AttackActiveWindowSeconds: " .. string.format("%.4f", Diagnostic.LastActiveWindowSeconds or 0)
     Lines[#Lines + 1] = "WeaponStatsLoadError: " .. tostring(AutoParryRuntime.StatsError or "none")
     Lines[#Lines + 1] = "WeaponStatsQueryError: " .. tostring(AutoParryRuntime.StatsQueryError or "none")
     Lines[#Lines + 1] = "LastObservedAttackTimingSource: " .. tostring(AutoParryRuntime.LastObservedTimingSource or "none")
