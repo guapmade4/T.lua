@@ -4063,6 +4063,10 @@ Main:RangeSlider({
     Flag = "AccuracyRange"
 })
 
+Main:Divider({Name = "Auto Kick"})
+Main:Toggle({Name = "Kick Aimed Blocking Opponent", Default = false, Flag = "AutoKickBlocking"})
+Main:Slider({Name = "Kick Target Distance", Min = 1, Max = 6, Step = 0.5, Default = 4, Suffix = " studs", Flag = "AutoKickRange"})
+
 Main:Divider({
     Name = "AutoPunish"
 })
@@ -6255,7 +6259,14 @@ local function AutoParryReach(Stats, Kind, WeaponName, Track)
             return NativeReach
         end
     end
-    AutoParryRuntime.LastReachSource = "WeaponStats geometry fallback"
+    if typeof(Size) == "Vector3" and typeof(Offset) == "CFrame" then
+        local Extent = math.abs(Offset.Position.Z) + Size.Z * 0.5
+        if Extent > 0 and Extent < math.huge then
+            AutoParryRuntime.LastReachSource = "Current WeaponStats hitbox extent"
+            return Extent
+        end
+    end
+    AutoParryRuntime.LastReachSource = "Missing geometry conservative fallback"
     local Reach = 7
     if typeof(Size) == "Vector3" then
         Reach = math.max(Reach, Size.Z * 0.5)
@@ -6547,7 +6558,7 @@ local function AutoDodgeFire(Threat)
     return Threat.Resolved == true
 end
 
-local function AutoParryLocalReady()
+local function AutoParryLocalReady(AllowCooldown)
     local function Blocked(Reason)
         AutoParryRuntime.LastSkip = Reason
         return false
@@ -6559,6 +6570,7 @@ local function AutoParryLocalReady()
     AutoParryRuntime.LocalWeaponSupported = AutoParrySupported(Stats)
     if AutoParryFlag("AutoParry") ~= true then return Blocked("Disabled") end
     if AutoParryRuntime.Dodge.Pending then return Blocked("Native dash pending") end
+    if AutoParryRuntime.Kick and AutoParryRuntime.Kick.Pending then return Blocked("Native kick pending") end
     if not Character or not Character.Parent then return Blocked("Local character unavailable") end
     if not AutoParryRuntime.LocalWeaponSupported then return Blocked("Weapon stats unavailable or unsupported") end
     local Humanoid = Character:FindFirstChildOfClass("Humanoid")
@@ -6569,10 +6581,131 @@ local function AutoParryLocalReady()
         if Character:GetAttribute(Name) == true then return Blocked("Local " .. Name) end
     end
     if not AutoParryCombat then return Blocked("Combat remote unavailable") end
-    if Character:GetAttribute("ParryCD") == true or os.clock() < AutoParryRuntime.ParryReadyAt then return Blocked("Parry cooldown") end
+    if not AllowCooldown and (Character:GetAttribute("ParryCD") == true or os.clock() < AutoParryRuntime.ParryReadyAt) then return Blocked("Parry cooldown") end
     AutoParryRuntime.LastSkip = "Ready; awaiting incoming attack"
     return true
 end
+
+-- Optional guard-break request. The server remains authoritative for hit/range/CD.
+AutoParryRuntime.Kick = {
+    Seen = setmetatable({}, {__mode = "k"}), Requests = 0, Starts = 0,
+    Rejected = 0, FireErrors = 0, ReadyAt = 0, NextScanAt = 0,
+    LastSkip = "Disabled", LastTarget = "none", LastError = "none"
+}
+
+AutoParryRuntime.UpdateKick = function()
+    local State = AutoParryRuntime.Kick
+    if AutoParryFlag("AutoKickBlocking") ~= true then
+        if State.WasEnabled then State.Seen = setmetatable({}, {__mode = "k"}); State.Pending = nil end
+        State.WasEnabled = false
+        State.LastSkip = "Disabled"
+        return
+    end
+    State.WasEnabled = true
+    local Now = os.clock()
+    if Now < State.NextScanAt then return end
+    State.NextScanAt = Now + 1 / 30
+    local Character = AutoParryLocalPlayer and AutoParryLocalPlayer.Character
+    if State.Character ~= Character then
+        State.Character, State.Pending = Character, nil
+        State.Seen = setmetatable({}, {__mode = "k"})
+        State.ReadyAt = 0
+    end
+    local Players = AutoParryPlayers:GetPlayers()
+    for _, Player in ipairs(Players) do
+        local Enemy = Player ~= AutoParryLocalPlayer and Player.Character
+        if Enemy and Enemy:GetAttribute("Blocking") ~= true then State.Seen[Enemy] = nil end
+    end
+    if State.Pending then
+        if Character and Character:GetAttribute("Attacking") == true then
+            State.Starts = State.Starts + 1
+            State.Pending = nil
+        elseif not Character or not Character.Parent or Now >= State.Pending.Deadline then
+            State.Rejected = State.Rejected + 1
+            State.Pending = nil
+            State.LastSkip = "No attack start observed after kick request"
+        else
+            State.LastSkip = "Kick request pending"
+            return
+        end
+    end
+    if Now < State.ReadyAt then State.LastSkip = "Attempt interval"; return end
+    if not Character or not Character.Parent then State.LastSkip = "Character unavailable"; return end
+    local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+    local Root = Character:FindFirstChild("HumanoidRootPart")
+    if not Humanoid or Humanoid.Health <= 0 or Humanoid.SeatPart or not Root then State.LastSkip = "Character unavailable or seated"; return end
+    if Character:GetAttribute("Sheathed") ~= false then State.LastSkip = "Weapon sheathed"; return end
+    local Stats = AutoParryGetStats(AutoParryWeaponName(AutoParryLocalPlayer, Character))
+    if not AutoParrySupported(Stats) then State.LastSkip = "Melee weapon required"; return end
+    for _, Name in ipairs({"Attacking", "Stunned", "Blocking", "Dashing", "IsRagdoll", "Disabled", "Emoting", "ParryRecovery", "GuardLocked", "BlockStun"}) do
+        if Character:GetAttribute(Name) == true then State.LastSkip = "Local " .. Name; return end
+    end
+    if AutoParryRuntime.Dodge.Pending then State.LastSkip = "Native dash pending"; return end
+    if AutoParryRuntime.Guard and AutoParryRuntime.Guard.Active then State.LastSkip = "Automatic guard has priority"; return end
+    if AutoParryRuntime.Punish and AutoParryRuntime.Punish.Pending then State.LastSkip = "Native swing pending"; return end
+    if not AutoParryCombat then State.LastSkip = "Combat remote unavailable"; return end
+    for Track, Threat in pairs(AutoParryRuntime.Threats or {}) do
+        local EnemyRoot = Threat.Character and Threat.Character:FindFirstChild("HumanoidRootPart")
+        if Track.IsPlaying and not Threat.Resolved and EnemyRoot and (EnemyRoot.Position - Root.Position).Magnitude <= (Threat.Reach or 7) + 1.25 then
+            State.LastSkip = "Incoming attack has priority"
+            return
+        end
+    end
+    local Range = math.max(1, math.min(6, tonumber(AutoParryFlag("AutoKickRange")) or 4))
+    local AimedPart
+    local AimRead = pcall(function()
+        local Workspace = game:GetService("Workspace")
+        local Camera = Workspace.CurrentCamera
+        if not Camera then return end
+        local Ray = Camera:ViewportPointToRay(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y * 0.5)
+        local Params = RaycastParams.new()
+        Params.FilterType = Enum.RaycastFilterType.Exclude
+        Params.FilterDescendantsInstances = {Character}
+        local Hit = Workspace:Raycast(Ray.Origin, Ray.Direction * 1000, Params)
+        AimedPart = Hit and Hit.Instance
+    end)
+    if not AimRead or not AimedPart then State.LastSkip = "No opponent under crosshair"; return end
+    local Target, TargetCharacter, Distance
+    for _, Player in ipairs(Players) do
+        local Enemy = Player ~= AutoParryLocalPlayer and Player.Character
+        if Enemy and Enemy.Parent and AimedPart:IsDescendantOf(Enemy) and not State.Seen[Enemy] and Enemy:GetAttribute("Blocking") == true and Enemy:GetAttribute("GuardLocked") ~= true then
+            local EnemyRoot = Enemy:FindFirstChild("HumanoidRootPart")
+            local EnemyHumanoid = Enemy:FindFirstChildOfClass("Humanoid")
+            if EnemyRoot and EnemyHumanoid and EnemyHumanoid.Health > 0 and Enemy:GetAttribute("IsRagdoll") ~= true then
+                local Delta = EnemyRoot.Position - Root.Position
+                local Current = Delta.Magnitude
+                local Facing = Current > 0.001 and Root.CFrame.LookVector:Dot(Delta.Unit) or 1
+                if Current <= Range and math.abs(Delta.Y) <= 3 and Facing >= 0.65 and (not Distance or Current < Distance) then
+                    local Visible, Clear = pcall(function()
+                        local Params = RaycastParams.new()
+                        Params.FilterType = Enum.RaycastFilterType.Exclude
+                        Params.FilterDescendantsInstances = {Character}
+                        local Hit = game:GetService("Workspace"):Raycast(Root.Position, Delta, Params)
+                        return not Hit or Hit.Instance:IsDescendantOf(Enemy)
+                    end)
+                    if Visible and Clear then Target, TargetCharacter, Distance = Player, Enemy, Current end
+                end
+            end
+        end
+    end
+    if not Target then State.LastSkip = "No unattempted blocking opponent in front and within distance"; return end
+    -- One-second attempt spacing is a local request limit, not an asserted server cooldown.
+    State.ReadyAt = Now + 1
+    local Success, Error = pcall(function() AutoParryCombat:FireServer("Kick", nil) end)
+    if not Success then
+        State.FireErrors = State.FireErrors + 1
+        State.LastError = tostring(Error):sub(1, 240)
+        State.LastSkip = "Kick request error"
+        return
+    end
+    State.Seen[TargetCharacter] = true
+    State.Pending = {Deadline = Now + 0.35}
+    State.Requests = State.Requests + 1
+    State.LastTarget = Target.Name
+    State.LastSkip = "Kick requested"
+    if AutoParryRuntime.Note then AutoParryRuntime.Note("Kick requested", Target.Name .. " blocking; distance " .. string.format("%.2f", Distance)) end
+end
+
 
 AutoParryRuntime.SampleDiagnostics = function(DeltaTime)
     local Diagnostic = AutoParryRuntime.Diagnostics
@@ -6637,7 +6770,9 @@ AutoParryRuntime.SampleDiagnostics = function(DeltaTime)
 end
 
 local function AutoParryFire(Threat)
-    if not AutoParryLocalReady() or not AutoParryCombat then
+    local Ready = AutoParryLocalReady()
+    local BlockOnly = not Ready and AutoParryRuntime.LastSkip == "Parry cooldown" and AutoParryLocalReady(true)
+    if (not Ready and not BlockOnly) or not AutoParryCombat then
         local Reason = not AutoParryCombat and "Combat remote unavailable" or AutoParryRuntime.LastSkip or "Local not ready"
         AutoParryRuntime.LastBlockedParryReason = Reason
         AutoParryRuntime.BlockedParryChecks = (AutoParryRuntime.BlockedParryChecks or 0) + 1
@@ -6648,12 +6783,11 @@ local function AutoParryFire(Threat)
         return false
     end
     local Now = os.clock()
+    if BlockOnly or Now < AutoParryRuntime.ParryReadyAt then
+        return AutoParryRuntime.HoldGuard(Threat, true)
+    end
     if Now - AutoParryRuntime.LastParryAt < 0.12 then
         AutoParryRuntime.LastSkip = "Parry debounce"
-        return false
-    end
-    if Now < AutoParryRuntime.ParryReadyAt then
-        AutoParryRuntime.LastSkip = "Parry cooldown"
         return false
     end
     local Success, Error = pcall(function()
@@ -6680,19 +6814,125 @@ local function AutoParryFire(Threat)
     AutoParryRuntime.LastReach = Threat.Reach or 0
     AutoParryRuntime.LastSkip = "none"
     if AutoParryRuntime.Note then AutoParryRuntime.Note("Parry requested", AutoParryRuntime.LastAttacker .. " " .. tostring(Threat.WeaponName) .. " " .. tostring(Threat.Kind)) end
-    pcall(function()
-        AutoParryCombat:FireServer("Block", "Block")
-    end)
-    task.delay(0.09, function()
-        pcall(function()
-            AutoParryCombat:FireServer("Block", "UnBlock")
-        end)
-    end)
+    AutoParryRuntime.HoldGuard(Threat, false)
     return true
 end
 
+-- Inlined by update_tournaments.py; only owns guard requests made by this script.
+AutoParryRuntime.Guard = {Active = false, Token = 0, Until = 0}
+
+AutoParryRuntime.ManualGuardHeld = function()
+    local Success, Held = pcall(function()
+        return game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.F)
+    end)
+    return Success and Held == true
+end
+
+AutoParryRuntime.ReleaseGuard = function(Reason)
+    local State = AutoParryRuntime.Guard
+    if not State.Active then return end
+    State.Active = false
+    State.Token = State.Token + 1
+    local Character = AutoParryLocalPlayer and AutoParryLocalPlayer.Character
+    -- A delayed release must not target a respawned character or manual F guard.
+    if Character ~= State.Character or AutoParryRuntime.ManualGuardHeld() then return end
+    local Success, Error = pcall(function() State.Remote:FireServer("Block", "UnBlock") end)
+    if not Success then
+        AutoParryRuntime.GuardFireErrors = (AutoParryRuntime.GuardFireErrors or 0) + 1
+        AutoParryRuntime.LastGuardError = tostring(Error):sub(1, 240)
+    end
+    State.LastReleaseReason = Reason
+end
+
+AutoParryRuntime.HoldGuard = function(Threat, Fallback)
+    local State = AutoParryRuntime.Guard
+    local Character = AutoParryLocalPlayer and AutoParryLocalPlayer.Character
+    if not Character or not Character.Parent or AutoParryFlag("AutoParry") ~= true or not AutoParryCombat then return false end
+    if State.Active and (State.Character ~= Character or State.Remote ~= AutoParryCombat) then
+        AutoParryRuntime.ReleaseGuard("Guard owner changed")
+    end
+    if not State.Active and Character:GetAttribute("Blocking") == true and AutoParryRuntime.ManualGuardHeld() then
+        AutoParryRuntime.LastSkip = "Manual guard held"
+        return not Fallback
+    end
+    local Now = os.clock()
+    local Success, _, Window = pcall(AutoParryRuntime.ActiveWindow, Threat.Stats or {}, Threat.Track, Threat.ImpactKeyTime or 0, Threat.Speed or 1)
+    if not Success or type(Window) ~= "number" then Window = 0.15 end
+    local Duration = (Threat.LastRemaining or 0) + Window + (AutoParryRuntime.LastPing or 0) + 0.03
+    Duration = math.max(0.1, math.min(0.75, Duration))
+    if not State.Active or State.Character ~= Character or State.Remote ~= AutoParryCombat then
+        local Sent, Error = pcall(function() AutoParryCombat:FireServer("Block", "Block") end)
+        if not Sent then
+            AutoParryRuntime.GuardFireErrors = (AutoParryRuntime.GuardFireErrors or 0) + 1
+            AutoParryRuntime.LastGuardError = tostring(Error):sub(1, 240)
+            AutoParryRuntime.LastSkip = "Guard request error"
+            return false
+        end
+        State.Active, State.Character, State.Remote, State.Until = true, Character, AutoParryCombat, 0
+        AutoParryRuntime.GuardRequests = (AutoParryRuntime.GuardRequests or 0) + 1
+        if Fallback then
+            AutoParryRuntime.FallbackBlockRequests = (AutoParryRuntime.FallbackBlockRequests or 0) + 1
+            if AutoParryRuntime.Note then AutoParryRuntime.Note("Block fallback requested", "Parry cooldown") end
+        end
+    end
+    State.Until = math.max(State.Until, Now + Duration)
+    State.Token = State.Token + 1
+    local Token = State.Token
+    task.delay(State.Until - Now, function()
+        if State.Active and State.Token == Token then
+            AutoParryRuntime.ReleaseGuard("Active window ended")
+        end
+    end)
+    AutoParryRuntime.LastSkip = Fallback and "Block fallback (parry cooldown)" or "Parry requested; guard held"
+    return true
+end
+
+AutoParryRuntime.GuardInputEnded = function(Input)
+    local State = AutoParryRuntime.Guard
+    if Input.KeyCode ~= Enum.KeyCode.F or not State.Active then return end
+    local Character, Remote = State.Character, State.Remote
+    -- The native F-release handler unblocks independently of our lease. Run after
+    -- it, retaining the original deadline instead of extending the guard.
+    task.defer(function()
+        if not State.Active or State.Character ~= Character or State.Remote ~= Remote or os.clock() >= State.Until then return end
+        if not AutoParryLocalReady(true) then AutoParryRuntime.ReleaseGuard("Local no longer ready"); return end
+        local Success, Error = pcall(function() Remote:FireServer("Block", "Block") end)
+        if Success then
+            AutoParryRuntime.GuardRequests = (AutoParryRuntime.GuardRequests or 0) + 1
+        else
+            AutoParryRuntime.GuardFireErrors = (AutoParryRuntime.GuardFireErrors or 0) + 1
+            AutoParryRuntime.LastGuardError = tostring(Error):sub(1, 240)
+        end
+    end)
+end
+
+pcall(function()
+    AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = game:GetService("UserInputService").InputEnded:Connect(AutoParryRuntime.GuardInputEnded)
+end)
+
+AutoParryRuntime.PollGuard = function()
+    local State = AutoParryRuntime.Guard
+    if not State.Active then return end
+    local Character = AutoParryLocalPlayer and AutoParryLocalPlayer.Character
+    if AutoParryFlag("AutoParry") ~= true or Character ~= State.Character or State.Remote ~= AutoParryCombat or os.clock() >= State.Until then
+        AutoParryRuntime.ReleaseGuard("Disabled, respawned, or expired")
+        return
+    end
+    for _, Name in ipairs({"Sheathed", "Attacking", "Stunned", "Dashing", "IsRagdoll", "Disabled", "Emoting", "GuardLocked"}) do
+        if Character:GetAttribute(Name) == true then
+            AutoParryRuntime.ReleaseGuard("Local " .. Name)
+            return
+        end
+    end
+end
+
+AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = {
+    Disconnect = function() AutoParryRuntime.ReleaseGuard("Script unloaded") end
+}
+
+
 local function AutoParryRegisterTrack(Player, Character, Track, Restart)
-    if AutoParryFlag("AutoParry") ~= true and AutoParryFlag("DodgeEnabled") ~= true then return end
+    if AutoParryFlag("AutoParry") ~= true and AutoParryFlag("DodgeEnabled") ~= true and AutoParryFlag("AutoKickBlocking") ~= true then return end
     local Seen = AutoParryRuntime.SeenTracks[Track]
     if Seen and not Restart and (type(Seen) ~= "number" or os.clock() < Seen) then
         return
@@ -6844,6 +7084,8 @@ AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = AutoParryRunSe
     local Success, Error = pcall(function()
     if AutoParryRuntime.ResolveDependencies then AutoParryRuntime.ResolveDependencies() end
     AutoDodgePoll()
+    AutoParryRuntime.PollGuard()
+    AutoParryRuntime.UpdateKick()
     if AutoParryRuntime.SampleDiagnostics then AutoParryRuntime.SampleDiagnostics(DeltaTime) end
     for Track in pairs(AutoParryRuntime.SeenTracks) do
         if not Track.IsPlaying then
@@ -6851,7 +7093,7 @@ AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = AutoParryRunSe
             AutoParryRuntime.Threats[Track] = nil
         end
     end
-    if AutoParryFlag("AutoParry") ~= true and AutoParryFlag("DodgeEnabled") ~= true then
+    if AutoParryFlag("AutoParry") ~= true and AutoParryFlag("DodgeEnabled") ~= true and AutoParryFlag("AutoKickBlocking") ~= true then
         AutoParryRuntime.ActiveThreats = 0
         return
     end
@@ -6983,7 +7225,7 @@ AutoParryRuntime.Connections[#AutoParryRuntime.Connections + 1] = AutoParryRunSe
             end
             if not Threat.Resolved and AutoParryFlag("DodgeEnabled") == true then
                 Threat.Resolved = AutoDodgeFire(Threat)
-            elseif not Threat.Resolved and Threat.Parryable ~= false and not Threat.AccuracyPassed then
+            elseif not Threat.Resolved and Threat.Parryable ~= false and not Threat.AccuracyPassed and AutoParryFlag("AutoKickBlocking") ~= true then
                 Threat.Resolved = true
             end
             if Threat.Resolved and not AutoParryRuntime.AdvanceThreat(Threat) then
@@ -7110,7 +7352,7 @@ do
 
     local function AutoPunishLocalReady(Ping)
         local State = AutoParryRuntime.Punish
-        if State.Pending or AutoParryRuntime.Dodge.Pending then
+        if State.Pending or AutoParryRuntime.Dodge.Pending or (AutoParryRuntime.Kick and AutoParryRuntime.Kick.Pending) then
             State.LastSkip = "Queued combat action"
             return nil
         end
@@ -7795,7 +8037,7 @@ local function BuildMainDebug()
     local RightSize = "not sampled"
 
     Lines[#Lines + 1] = "=== eve.club Main Debug ==="
-    Lines[#Lines + 1] = "ScriptVersion: 149"
+    Lines[#Lines + 1] = "ScriptVersion: 151"
     Lines[#Lines + 1] = "Username: " .. tostring(State.Context.Username)
     Lines[#Lines + 1] = "DisplayName: " .. tostring(State.Context.DisplayName)
     Lines[#Lines + 1] = "UserId: " .. tostring(State.Context.UserId)
@@ -7878,6 +8120,12 @@ local function BuildMainDebug()
     Lines[#Lines + 1] = "AutoParryParries: " .. tostring(State.AutoParryParries or 0)
     Lines[#Lines + 1] = "AutoParryCountType: requests sent"
     Lines[#Lines + 1] = "AutoParryFireErrors: " .. tostring(State.AutoParryFireErrors or 0)
+    Lines[#Lines + 1] = "AutoGuardRequests: " .. tostring(AutoParryRuntime.GuardRequests or 0)
+    Lines[#Lines + 1] = "AutoGuardFallbackBlockRequests: " .. tostring(AutoParryRuntime.FallbackBlockRequests or 0)
+    Lines[#Lines + 1] = "AutoGuardActive: " .. tostring(AutoParryRuntime.Guard.Active)
+    Lines[#Lines + 1] = "AutoGuardFireErrors: " .. tostring(AutoParryRuntime.GuardFireErrors or 0)
+    Lines[#Lines + 1] = "AutoGuardLastError: " .. tostring(AutoParryRuntime.LastGuardError or "none")
+    Lines[#Lines + 1] = "AutoGuardCountType: block requests sent, not confirmed blocks or parries"
     Lines[#Lines + 1] = "AutoParryNativeFallbackCooldownSeconds: 2"
     Lines[#Lines + 1] = "AutoParryBlockedChecks: " .. tostring(AutoParryRuntime.BlockedParryChecks or 0)
     Lines[#Lines + 1] = "AutoParryLastBlockedReason: " .. tostring(AutoParryRuntime.LastBlockedParryReason or "none")
@@ -7899,6 +8147,16 @@ local function BuildMainDebug()
     Lines[#Lines + 1] = "AutoParryPrediction: " .. string.format("%.4f", tonumber(State.AutoParryPrediction) or 0)
     Lines[#Lines + 1] = "AutoParryPingCompensation: " .. string.format("%.4f", tonumber(State.AutoParryPing) or 0)
     Lines[#Lines + 1] = "AutoParryReach: " .. string.format("%.2f", tonumber(State.AutoParryReach) or 0)
+    Lines[#Lines + 1] = "AutoKickEnabled: " .. tostring(AutoParryFlag("AutoKickBlocking") == true)
+    Lines[#Lines + 1] = "AutoKickTargetMode: crosshair player, in front and within configured distance"
+    Lines[#Lines + 1] = "AutoKickRequests: " .. tostring(AutoParryRuntime.Kick.Requests)
+    Lines[#Lines + 1] = "AutoKickSubsequentAttackStarts: " .. tostring(AutoParryRuntime.Kick.Starts)
+    Lines[#Lines + 1] = "AutoKickUnobservedStarts: " .. tostring(AutoParryRuntime.Kick.Rejected)
+    Lines[#Lines + 1] = "AutoKickFireErrors: " .. tostring(AutoParryRuntime.Kick.FireErrors)
+    Lines[#Lines + 1] = "AutoKickLastError: " .. tostring(AutoParryRuntime.Kick.LastError)
+    Lines[#Lines + 1] = "AutoKickLastTarget: " .. tostring(AutoParryRuntime.Kick.LastTarget)
+    Lines[#Lines + 1] = "AutoKickLastSkip: " .. tostring(AutoParryRuntime.Kick.LastSkip)
+    Lines[#Lines + 1] = "AutoKickCountType: requests and subsequent attack starts, not confirmed guard breaks"
     Lines[#Lines + 1] = "AutoPunishDivider: present"
     Lines[#Lines + 1] = "AutoPunishEnabled: " .. tostring(State.AutoPunishEnabled)
     Lines[#Lines + 1] = "AutoPunishRequests: " .. tostring(State.AutoPunishRequests)
